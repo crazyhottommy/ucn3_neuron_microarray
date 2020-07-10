@@ -1,0 +1,164 @@
+---
+title: "Mouse_affy_exon_array"
+output: html_document
+---
+
+read https://www.ncbi.nlm.nih.gov/pubmed/23603090
+
+read https://support.bioconductor.org/p/46171/
+
+follow https://www.bioconductor.org/packages//2.7/bioc/vignettes/oligo/inst/doc/V5ExonGene.pdf
+
+Okay, even Gordon Smyth asked the same question https://support.bioconductor.org/p/98069/
+I am not dumb.
+
+
+The default for rma in oligo for these arrays is to summarize the core probesets at the transcript level
+
+```{r}
+library(oligo)
+exonCELs<- list.celfiles("data/Affy_exon", full.names = T)
+affyExonFS <- read.celfiles(exonCELs)
+exonPS <- rma(affyExonFS)
+
+library(moex10sttranscriptcluster.db)
+ann <- select(moex10sttranscriptcluster.db,keys=featureNames(exonPS),
+       columns=c("ENTREZID","SYMBOL","GENENAME","CHR"),keytype="PROBEID")
+
+d <- duplicated(ann$PROBEID)
+ann <- ann[!d,]
+m <- match(featureNames(exonPS), ann$PROBEID)
+fData(exonPS) <- ann[m,-1]
+```
+
+```{r}
+MAplot(exonPS, pairs=TRUE)
+boxplot(exonPS)
+```
+
+### PCA plot
+
+```{r}
+e<- exprs(exonPS) 
+pca_prcomp<- prcomp(t(e), center = TRUE, scale. = FALSE)
+plot(pca_prcomp)
+## the first two PCs 
+pca_prcomp$x[,1:2]
+PC1_and_PC2<- data.frame(PC1=pca_prcomp$x[,1], PC2= pca_prcomp$x[,2], sample = rownames(pca_prcomp$x))
+PC1_and_PC2<- PC1_and_PC2 %>% separate(sample, into = c("type", "extra"), extra = "merge")
+## plot PCA plot
+library(ggplot2)
+ggplot(PC1_and_PC2, aes(x=PC1, y=PC2, col= type)) + geom_point(aes(shape = type), size = 3)+
+        theme_classic(base_size = 14) +
+        ggtitle("PCA plot for all 9 samples")
+ggsave("results/Cfos_Oxt_Unk_PCA.pdf", width = 8, height = 6)
+```
+
+
+### limma differential expression 
+
+```{r}
+
+library(limma)
+phenoData(exonPS)
+design<- model.matrix(~0+factor(c(1,1,1,2,2,2,3,3,3)))
+colnames(design)<- c("Cfos", "Oxt","Unk")
+fit <- lmFit(exonPS, design)
+
+contrast.matrix<- makeContrasts(Cfos-Unk,Oxt-Unk,Cfos-Oxt, levels=design)
+
+fit2<- contrasts.fit(fit, contrast.matrix)
+fit2<- eBayes(fit2)
+#save(exonPS, fit2, file = "data/Affy_exon/affy_mouse_exon.rda")
+fit2$coefficients %>% head()
+saveRDS()
+toptable<- topTable(fit2, coef=1,number=Inf, sort.by="P")
+toptable %>% filter(SYMBOL == "Ucn3")
+toptable %>% filter(SYMBOL == "Avp")
+hist(toptable$P.Value)
+hist(toptable$adj.P.Val)
+
+e<- exprs(exonPS)
+head(toptable)
+
+
+toptable$P.Value %>% tibble::enframe(value = "pvalue") %>%
+        ggplot(aes(x = pvalue)) + geom_histogram(col = "white", bins = 50) +
+        theme_classic(base_size = 14) +
+        geom_hline(yintercept = 430, linetype = 2, color = "red") + 
+        ggtitle("Cfos vs Unk pvalue distribution")
+ggsave("results/Cfos_vs_Unk_pvalue.pdf", width=8 , height = 6)
+```
+
+Volcano plot
+
+```{r}
+library(ggrepel)
+res<- as.data.frame(toptable)
+res %>% arrange(P.Value, abs(logFC)) %>% filter(!is.na(SYMBOL)) %>%
+        write_tsv("results/Cfos_vs_Unk_differential_genes.txt")
+res<- mutate(res, sig=ifelse(res$P.Value<0.001 & abs(res$logFC) >2, "pvalue<0.001", "Not Sig")) %>% 
+        filter(!is.na(SYMBOL))
+p<- ggplot(res, aes(x = logFC, y = -log10(P.Value))) +
+        geom_point(aes(col = sig)) +
+        scale_color_manual(values=c("black", "red"))
+
+p
+p+ geom_hline(yintercept = 3, linetype = 2) + 
+        geom_vline(xintercept = c(-2, 2), linetype = 2) + 
+        geom_text_repel(data=filter(res, SYMBOL %in% c("Avp", "Ucn3", "Gal", "Trh", "Oxt", "Pvalb")), aes(label=SYMBOL)) + 
+        theme_classic(base_size = 14)
+
+
+ggsave("results/Cofs_vs_Unk_volcano_plot.pdf", width = 8, height = 6)
+
+res %>% filter(SYMBOL %in% c("Avp", "Ucn3", "Gal", "Trh", "Oxt", "Pvalb"))
+```
+
+### heatmap 
+
+```{r}
+head(e)
+library(genefilter)
+rv<-rowVars(e)  #vsd is an expression set object after variance stablizing transformation
+idx<- order(-rv)[1:500]  # idx by the variance
+
+library(ComplexHeatmap)
+probes_sel<- as.data.frame(toptable) %>% tibble::rownames_to_column(var = "probeID") %>%
+        filter(P.Value <= 0.01, abs(logFC) > 1) %>% pull(probeID)
+mat_sub<- t(scale(t(e[rownames(e) %in% probes_sel,c(1:3,7:9)]), center = TRUE))
+
+## anno_mark() to mark those two genes: Ucn3 and Avp
+
+mark<- as.data.frame(toptable) %>% tibble::rownames_to_column(var = "probeID") %>%
+        filter(P.Value <= 0.01, abs(logFC) > 1) %>% 
+        filter(SYMBOL %in% c("Ucn3", "Avp")) %>%
+        pull(probeID)
+
+which(rownames(mat_sub) %in% mark)
+ha<- rowAnnotation(foo = anno_mark(at = c(55, 108), labels = c("Ucn3", "Avp")))
+colnames(mat_sub)<- c("Cfos1", "Cfos2", "Cfos3", "Unk1", "Unk2", "Unk3")
+Heatmap(mat_sub, show_row_names = F, name = "scaled expression", right_annotation = ha)
+
+```
+
+
+### test IHW for better FDR
+http://bioconductor.org/packages/release/bioc/vignettes/IHW/inst/doc/introduction_to_ihw.html#fdr-control
+
+```{r}
+library(IHW)
+deRes<- res
+table(res$adj.P.Val < 0.05)
+ihwRes <- ihw(P.Value ~ AveExpr,  data = deRes, alpha = 0.1)
+table(adj_pvalues(ihwRes) < 0.05)
+
+dim(res)
+length(adj_pvalues(ihwRes))
+
+res$IHW<- adj_pvalues(ihwRes)
+
+res %>% filter(SYMBOL == "Ucn3")
+res %>% filter(SYMBOL == "Avp")
+
+```
